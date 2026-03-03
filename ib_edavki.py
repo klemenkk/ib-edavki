@@ -758,6 +758,169 @@ def main():
                     "Error: cannot figure out if trade is Normal or Derivate, Long or Short"
                 )
 
+    """ Fix F8 balance violations by re-simulating position changes.
+
+        FURS eDavki requires:
+          - Securities (long):      running balance (F8/Zaloga) >= 0 at every row
+          - SecuritiesShort (short): running balance (F8/Zaloga) <= 0 at every row
+
+        IB's per-trade openCloseIndicator classification doesn't guarantee this
+        invariant when a security has mixed long/short activity. We fix it by:
+        1. Merging all trades for each security into one chronological list
+        2. Simulating the running position
+        3. Assigning each trade to long or short based on actual position state
+        4. Splitting trades that cross the zero boundary
+    """
+    def fixF8Violations(longTrades, shortTrades):
+        # Collect all securityIDs that exist in either dict
+        allIDs = set(list(longTrades.keys()) + list(shortTrades.keys()))
+        fixCount = 0
+
+        for securityID in allIDs:
+            longs = longTrades.get(securityID, [])
+            shorts = shortTrades.get(securityID, [])
+
+            # Quick check: does this security need fixing?
+            # Simulate F8 for longs
+            needsFix = False
+            f8 = 0
+            for t in longs:
+                f8 += t["quantity"]
+                if f8 < -0.001:
+                    needsFix = True
+                    break
+            if not needsFix:
+                f8 = 0
+                for t in shorts:
+                    f8 += t["quantity"]
+                    if f8 > 0.001:
+                        needsFix = True
+                        break
+            if not needsFix:
+                continue
+
+            # Merge all trades and sort chronologically
+            # Within same date+time, buys before sells (minimizes position crossings)
+            allTrades = longs + shorts
+            allTrades.sort(key=lambda t: (
+                t["tradeDate"],
+                t["tradeTime"],
+                0 if t["quantity"] > 0 else 1  # buys first within same timestamp
+            ))
+
+            newLongs = []
+            newShorts = []
+            position = 0.0
+
+            for trade in allTrades:
+                qty = trade["quantity"]
+
+                if abs(qty) < 1e-9:
+                    continue
+
+                if position >= 0:
+                    # Currently long or flat
+                    if qty > 0:
+                        # Buying more → stays long
+                        newLongs.append(trade)
+                        position += qty
+                    else:
+                        # Selling
+                        sellQty = -qty  # positive number
+                        if sellQty <= position + 1e-9:
+                            # Selling within long inventory → stays long
+                            newLongs.append(trade)
+                            position += qty
+                        else:
+                            # Selling more than long inventory → split
+                            if position > 0.001:
+                                # Part 1: close long position to zero
+                                longPart = copy.copy(trade)
+                                longPart["quantity"] = -position  # negative
+                                newLongs.append(longPart)
+                            # Part 2: open short position with remainder
+                            shortQty = sellQty - max(position, 0)
+                            if shortQty > 0.001:
+                                shortPart = copy.copy(trade)
+                                shortPart["quantity"] = -shortQty  # negative
+                                newShorts.append(shortPart)
+                            position = -(sellQty - max(position, 0))
+                else:
+                    # Currently short (position < 0)
+                    if qty < 0:
+                        # Selling more → stays short
+                        newShorts.append(trade)
+                        position += qty
+                    else:
+                        # Buying (covering)
+                        buyQty = qty  # positive number
+                        shortPos = -position  # positive number representing short size
+                        if buyQty <= shortPos + 1e-9:
+                            # Covering within short inventory → stays short
+                            newShorts.append(trade)
+                            position += qty
+                        else:
+                            # Covering more than short → split
+                            if shortPos > 0.001:
+                                # Part 1: close short to zero
+                                shortPart = copy.copy(trade)
+                                shortPart["quantity"] = shortPos  # positive
+                                newShorts.append(shortPart)
+                            # Part 2: open long with remainder
+                            longQty = buyQty - shortPos
+                            if longQty > 0.001:
+                                longPart = copy.copy(trade)
+                                longPart["quantity"] = longQty  # positive
+                                newLongs.append(longPart)
+                            position = buyQty - shortPos
+
+            # Sort the new lists chronologically (buys before sells on same date)
+            for lst in (newLongs, newShorts):
+                lst.sort(key=lambda t: (
+                    t["tradeDate"],
+                    t["tradeTime"],
+                    0 if t["quantity"] > 0 else 1
+                ))
+
+            # Verify F8 invariants
+            f8 = 0
+            longOk = True
+            for t in newLongs:
+                f8 += t["quantity"]
+                if f8 < -0.01:
+                    longOk = False
+                    break
+            f8 = 0
+            shortOk = True
+            for t in newShorts:
+                f8 += t["quantity"]
+                if f8 > 0.01:
+                    shortOk = False
+                    break
+
+            if longOk and shortOk:
+                if newLongs:
+                    longTrades[securityID] = newLongs
+                elif securityID in longTrades:
+                    del longTrades[securityID]
+                if newShorts:
+                    shortTrades[securityID] = newShorts
+                elif securityID in shortTrades:
+                    del shortTrades[securityID]
+                fixCount += 1
+                sym = newLongs[0]["symbol"] if newLongs else (newShorts[0]["symbol"] if newShorts else securityID)
+                print(f"  Fixed F8 violations for {sym}: {len(longs)}L+{len(shorts)}S → {len(newLongs)}L+{len(newShorts)}S trades")
+            else:
+                sym = allTrades[0]["symbol"] if allTrades else securityID
+                print(f"  WARNING: Could not fix F8 violations for {sym} (longOk={longOk}, shortOk={shortOk})")
+
+        return fixCount
+
+    normalFixes = fixF8Violations(longNormalTrades, shortNormalTrades)
+    derivateFixes = fixF8Violations(longDerivateTrades, shortDerivateTrades)
+    if normalFixes + derivateFixes > 0:
+        print(f"Fixed F8 violations for {normalFixes} normal + {derivateFixes} derivate securities")
+
     """ Generate the files for Normal """
     envelope = xml.etree.ElementTree.Element(
         "Envelope", xmlns="http://edavki.durs.si/Documents/Schemas/Doh_KDVP_9.xsd"
