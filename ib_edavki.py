@@ -24,6 +24,8 @@ userAgent = 'ib-edavki'
 
 stockSplits = defaultdict(list)
 cusipIsinChanges = defaultdict(list)
+isinSplitMappings = {}   # old_isin -> new_isin  (for splits that change ISIN/conid)
+conidSplitMappings = {}   # old_conid -> new_conid
 
 
 def getSplitMultiplier(symbol, conid, date, time):
@@ -47,15 +49,58 @@ def getSplitMultiplier(symbol, conid, date, time):
     return multiplier
 
 
-""" Stores stock splits with multiplier by date and time
+""" Stores stock splits with multiplier by date and time.
+    Also detects ISIN-changing splits (where IB emits TWO CorporateAction entries
+    with the same actionID but different conids) and populates isinSplitMappings,
+    conidSplitMappings, and cusipIsinChanges so that old-ISIN trades are merged
+    with new-ISIN trades during trade grouping.
 """
 def addStockSplits(corporateActions):
+    # First pass: group split CAs by actionID to detect multi-conid (ISIN-changing) splits
+    splitsByActionId = defaultdict(list)
     for action in corporateActions:
         description = action.attrib["description"]
         descriptionSearch = re.search(r"SPLIT (.+) FOR (.+) \(", description)
         if descriptionSearch is not None:
-            # we have to extract split information from description since IB does not provide
-            # any information on what the corporate action is
+            splitsByActionId[action.attrib["actionID"]].append(action)
+
+    # Second pass: process each split group
+    for actionID, actions in splitsByActionId.items():
+        # Detect multi-conid (ISIN-changing) split: same actionID, different conids
+        conids = set(a.attrib["conid"] for a in actions)
+        if len(conids) > 1 and len(actions) == 2:
+            # Find old side (negative quantity) and new side (positive quantity)
+            oldAction = None
+            newAction = None
+            for a in actions:
+                qty = float(a.attrib["quantity"])
+                if qty < 0:
+                    oldAction = a
+                elif qty > 0:
+                    newAction = a
+            if oldAction is not None and newAction is not None:
+                oldConid = oldAction.attrib["conid"]
+                newConid = newAction.attrib["conid"]
+                oldIsin = oldAction.attrib.get("isin", "")
+                newIsin = newAction.attrib.get("isin", "")
+                oldCusip = oldAction.attrib.get("cusip", "")
+                newCusip = newAction.attrib.get("cusip", "")
+                symbol = newAction.attrib["symbol"]
+
+                conidSplitMappings[oldConid] = newConid
+                if oldIsin and newIsin and oldIsin != newIsin:
+                    isinSplitMappings[oldIsin] = newIsin
+                    cusipIsinChanges[oldIsin] = newIsin
+                    print(f"  ISIN-changing split detected: {symbol} {oldIsin} -> {newIsin} (conid {oldConid} -> {newConid})")
+                if oldCusip and newCusip and oldCusip != newCusip:
+                    cusipIsinChanges[oldCusip] = newCusip
+
+        # Process each action in this group for stockSplits registration
+        for action in actions:
+            description = action.attrib["description"]
+            descriptionSearch = re.search(r"SPLIT (.+) FOR (.+) \(", description)
+            if descriptionSearch is None:
+                continue
 
             multiplier = float(descriptionSearch.group(1)) / float(
                 descriptionSearch.group(2)
