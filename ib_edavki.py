@@ -613,6 +613,10 @@ def main():
                     del openTrade["openTransactionIds"]
                     xtrades.append(closeTrade)
                     xtrades.append(openTrade)
+                    # Update tradesByTransactionID: the original object is replaced
+                    # by two copies. Point to openTrade so future close-trade lots
+                    # that reference this transactionID can find it as an "O" trade.
+                    tradesByTransactionID[trade["transactionID"]] = openTrade
         trades[securityID] = xtrades
 
     """ Detect if trades are Normal or Derivates and if they are Opening or Closing positions
@@ -659,7 +663,7 @@ def main():
         for trade in trades[securityID]:
             if (
                 trade["tradeDate"][0:4] == str(reportYear)
-                and trade["openCloseIndicator"] == "C"
+                and "C" in trade["openCloseIndicator"]
             ):
                 if securityID not in yearTrades:
                     yearTrades[securityID] = []
@@ -684,7 +688,7 @@ def main():
                     else:
                         """ Get the corresponding open trade (which may have different initial securityID) """
                         xtrade = tradesByTransactionID[tid]
-                        if (xtrade["openCloseIndicator"] == "O"):
+                        if "O" in xtrade["openCloseIndicator"]:
                             ctrade = copy.copy(xtrade)
                             ctrade["quantity"] = trade["openTransactionIds"][tid]["quantity"]
                             yearTrades[securityID].append(ctrade)
